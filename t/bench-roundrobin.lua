@@ -28,9 +28,12 @@ local function bench(num, name, func, typ, ...)
         elasped = elasped - base_time
     end
 
+    local per_call = elasped * 1000 * 1000 / num
+
     ngx.say(name)
     ngx.say(num, " times")
     ngx.say("elasped: ", elasped)
+    ngx.say("lb time per request: " .. per_call .. " (us)")
     ngx.say("")
 
     if not typ then
@@ -40,6 +43,7 @@ end
 
 
 local resty_rr = require "resty.roundrobin"
+local resty_ewma = require "resty.ewma"
 
 local servers = {
     ["server1"] = 10,
@@ -69,7 +73,18 @@ local servers3 = {
     ["server12"] = 1,
 }
 
-local rr = resty_rr:new(servers)
+local backends = {}
+local servers4 = {}
+for i=1,1000 do
+  servers4["server"..i] = 1
+  backends[i] = { address = "10.10.10." .. i, port = "8080", maxFails = 0, failTimeout = 0 }
+end
+
+print(backends[1])
+
+local rr = resty_rr:new(servers4)
+local ewma = resty_ewma:new({ endpoints = backends })
+ewma:sync({ endpoints = backends })
 
 local function gen_func(typ)
     local i = 0
@@ -123,19 +138,40 @@ local function gen_func(typ)
             i = i + 1
         end, typ
     end
+
+    -- Weighted round robin load balancing
+    if typ == 102 then
+      return function()
+          i = i + 1
+
+          -- balance
+          local sid = rr:find(i)
+
+          -- after_balance
+          local util = math.random()
+          rr:set(sid, util)
+
+          i = i + 1
+      end, typ
+    end
+
+    -- EWMA based load balancing
+    if typ == 103 then
+      return function()
+        i = i + 1
+
+        -- balance
+        local upstream_addr = ewma:balance()
+
+        -- after_balance
+        ewma:after_balance(math.random(100, 500), upstream_addr)
+
+        i = i + 1
+      end, type
+    end
 end
 
-bench(10 * 1000, "rr new servers", resty_rr.new, nil, nil, servers)
-bench(1 * 1000, "rr new servers2", resty_rr.new, nil, nil, servers2)
-bench(10 * 1000, "rr new servers3", resty_rr.new, nil, nil, servers3)
-bench(10 * 1000, "new in func", gen_func(0))
-bench(10 * 1000, "new dynamic", gen_func(1))
-bench(10 * 1000, "incr server3", gen_func(2))
-
 bench(1000 * 1000, "base for find", gen_func(100))
-
-bench(1000 * 1000, "find from 3 servers", gen_func(101))
-rr:delete("server2")
-bench(1000 * 1000, "find from 2 servers", gen_func(101))
-rr:delete("server3")
-bench(1000 * 1000, "find from 1 server", gen_func(101))
+bench(1000 * 1000, "round_robin with no after_balance", gen_func(101))
+bench(100 * 100, "round_robin with after_balance { rr:set(new_weight) }", gen_func(102))
+bench(100 * 100, "ewma with resp_time after_balance", gen_func(103))
